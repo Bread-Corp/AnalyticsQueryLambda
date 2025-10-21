@@ -1,132 +1,183 @@
 import json
+import requests # Provided by layer
+import db_handler # Our custom module
 import os
-import pymssql
 
-# --- Global Scope ---
-db_endpoint = os.environ.get('DB_ENDPOINT')
-db_name = os.environ.get('DB_NAME')
-db_user = os.environ.get('DB_USER')
-db_password = os.environ.get('DB_PASSWORD')
-db_port = 1433
+# --- API Endpoints ---
+USER_FETCH_API_URL = os.environ.get("USER_FETCH_API_URL", "https://4owkixd548.execute-api.us-east-1.amazonaws.com/dev/tenderuser/fetch/{}")
+WATCHLIST_API_URL = os.environ.get("WATCHLIST_API_URL", "https://4owkixd548.execute-api.us-east-1.amazonaws.com/dev/watchlist/{}")
+API_TIMEOUT_SECONDS = 10
 
-db_connection = None
+def format_error_response(message="An internal server error occurred.", status_code=500):
+    """ Creates a standardized error response for API Gateway """
+    return {
+        'statusCode': status_code,
+        'headers': {'Access-Control-Allow-Origin': '*'},
+        'body': json.dumps({'error': message})
+    }
 
-def get_db_connection():
+def get_public_analytics(cursor):
+    """ Gathers all public analytics data using the db_handler """
+    print("Getting public analytics...")
+    status_data = db_handler.fetch_public_status_breakdown(cursor)
+    location_data = db_handler.fetch_public_location_breakdown(cursor)
+
+    total_tenders = status_data.get("totalTenders", 0)
+    open_tenders = status_data.get("openTenders", 0)
+    open_ratio = (open_tenders / total_tenders) * 100 if total_tenders > 0 else 0
+
+    return {
+        "totalTenders": total_tenders,
+        "openTenders": open_tenders,
+        "closedTenders": status_data.get("closedTenders", 0),
+        "openRatio": round(open_ratio, 2),
+        "statusBreakdown": status_data.get("statusBreakdown", []),
+        "tendersByProvince": location_data
+    }
+
+def format_standard_user_analytics(api_response, cursor):
     """
-    Establishes or reuses a database connection using credentials from environment variables.
+    Formats the Standard User payload.
+    Includes all public analytics PLUS user-specific watchlist stats.
     """
-    global db_connection
-    if db_connection:
-        try:
-            db_connection.autocommit(True)
-            cursor = db_connection.cursor()
-            cursor.execute("SELECT 1")
-            cursor.close()
-            print("Reusing existing database connection.")
-            return db_connection
-        except Exception as e:
-            print(f"Stale connection detected, reconnecting. Reason: {e}")
-            db_connection = None
+    print("Formatting standard user analytics...")
+    # 1. Get the base public analytics data
+    analytics_payload = get_public_analytics(cursor)
 
-    print("Connecting directly to RDS instance with credentials from environment variables.")
-    db_connection = pymssql.connect(
-        server=db_endpoint,
-        user=db_user,
-        password=db_password,
-        database=db_name,
-        port=db_port,
-        autocommit=True
-    )
-    print("Database connection established successfully.")
-    return db_connection
+    # 2. Extract watchlist stats from the API response
+    watchlist_analytics = api_response.get('analytics', {})
+    total_watched = watchlist_analytics.get('count', 0)
+    closed_watched = watchlist_analytics.get('closed', 0)
+    open_watched = total_watched - closed_watched
+
+    # 3. Add the user-specific section with the new name
+    analytics_payload["standardUserAnalytics"] = { # Renamed from quickInsights
+        "totalUserTenders": total_watched,
+        "openUserTenders": open_watched,
+        "userOpenRatio": round((open_watched / total_watched) * 100, 2) if total_watched > 0 else 0,
+        "closingSoon": watchlist_analytics.get('closingSoon', 0),
+        "closingLater": watchlist_analytics.get('closingLater', 0)
+    }
+    return analytics_payload
+
+def format_super_user_analytics(api_response, cursor):
+    """
+    Formats the Super User payload.
+    Includes all public analytics, source breakdown, PLUS admin stats.
+    """
+    print("Formatting super user analytics...")
+    # 1. Get all public analytics data
+    analytics_payload = get_public_analytics(cursor)
+    
+    # 2. Get the source breakdown from the database
+    source_data = db_handler.fetch_source_breakdown(cursor)
+    analytics_payload["tendersBySource"] = source_data
+    
+    # 3. Add admin stats from the /fetch API response with the new name
+    analytics_payload["superUserAnalytics"] = { # Renamed from adminStats
+        "totalUsers": api_response.get("userCount", 0),
+        "standardUsers": api_response.get("standardUserCount", 0),
+        "superUsers": api_response.get("superUserCount", 0),
+        "newRegistrationsThisMonth": api_response.get("registeredRecently", 0)
+    }
+    
+    return analytics_payload
 
 def lambda_handler(event, context):
+    print(f"Received event: {event}")
+    user_id = None
+    cursor = None # Ensure cursor is defined for finally block
+    conn = None # Ensure conn is defined for finally block
+
     try:
-        conn = get_db_connection()
+        # Check for the User ID in headers (case-insensitive)
+        headers = event.get('headers', {})
+        user_id = headers.get('x-user-id') or headers.get('X-User-ID')
+        print(f"Extracted UserID: {user_id}")
+
+        conn = db_handler.get_db_connection()
         cursor = conn.cursor(as_dict=True)
         
-        print("Executing analytics queries...")
-        
-        # Query 1: Get the status breakdown directly from the 'Status' column.
-        status_sql = "SELECT Status, COUNT(*) as value FROM dbo.BaseTender GROUP BY Status;"
-        cursor.execute(status_sql)
-        status_rows = cursor.fetchall()
-        
-        # Initial counts from the database
-        db_open_count = next((item['value'] for item in status_rows if item.get('Status') == 'Open'), 0)
-        db_closed_count = next((item['value'] for item in status_rows if item.get('Status') == 'Closed'), 0)
-        
-        # Query 2: The "Final Precaution" - Find 'Open' tenders that are now closed.
-        correction_sql = "SELECT COUNT(*) as stale_count FROM dbo.BaseTender WHERE Status = 'Open' AND closingDate < GETDATE();"
-        cursor.execute(correction_sql)
-        stale_count = cursor.fetchone()['stale_count']
-        
-        print(f"Found {stale_count} stale 'Open' tenders that are now closed.")
+        analytics_payload = {}
 
-        # --- Real-time correction of the numbers ---
-        final_open_tenders = db_open_count - stale_count
-        final_closed_tenders = db_closed_count + stale_count
-        total_tenders = final_open_tenders + final_closed_tenders
+        if not user_id:
+            # --- Scenario 1: Public Analytics ---
+            print("No UserID provided, fetching public analytics.")
+            analytics_payload = get_public_analytics(cursor)
+        else:
+            # --- Scenario 2 or 3: User-Specific Analytics ---
+            is_super_user = False
+            super_user_data = None
+            
+            # Attempt to fetch Super User data
+            try:
+                print(f"Attempting Super User fetch for UserID: {user_id}")
+                response = requests.get(USER_FETCH_API_URL.format(user_id), timeout=API_TIMEOUT_SECONDS)
+                print(f"Super User API response status: {response.status_code}")
+                
+                if response.status_code == 200:
+                    super_user_data = response.json()
+                    is_super_user = True
+                else:
+                    print(f"Super User fetch failed or user is not admin (Status: {response.status_code}). Proceeding to Standard User check.")
+                    
+            except requests.exceptions.RequestException as e:
+                print(f"WARNING: Request to Super User API failed: {e}. Proceeding to Standard User check.")
+            except json.JSONDecodeError as e:
+                 print(f"WARNING: Failed to decode Super User API response: {e}. Proceeding to Standard User check.")
 
-        status_breakdown = [
-            {'name': 'Open', 'value': final_open_tenders},
-            {'name': 'Closed', 'value': final_closed_tenders}
-        ]
+            if is_super_user and super_user_data:
+                # --- Scenario 3: Super User Analytics ---
+                print("User is Super User, formatting Super User analytics.")
+                analytics_payload = format_super_user_analytics(super_user_data, cursor)
+            else:
+                # Attempt to fetch Standard User data (Watchlist)
+                try:
+                    print(f"Attempting Standard User watchlist fetch for UserID: {user_id}")
+                    response = requests.get(WATCHLIST_API_URL.format(user_id), timeout=API_TIMEOUT_SECONDS)
+                    print(f"Standard User API response status: {response.status_code}")
 
-        # --- Resilient Location Querying (with corrected column names) ---
-        all_locations = []
+                    if response.status_code == 200:
+                        # --- Scenario 2: Standard User Analytics ---
+                        print("User is Standard User, formatting Standard User analytics.")
+                        standard_user_data = response.json()
+                        # Pass cursor here to fetch public data
+                        analytics_payload = format_standard_user_analytics(standard_user_data, cursor)
+                    else:
+                        # If watchlist also fails, assume invalid ID and show public
+                        print(f"Standard User watchlist fetch failed (Status: {response.status_code}). Falling back to public analytics.")
+                        analytics_payload = get_public_analytics(cursor)
+                        
+                except requests.exceptions.RequestException as e:
+                    print(f"WARNING: Request to Standard User API failed: {e}. Falling back to public analytics.")
+                    analytics_payload = get_public_analytics(cursor)
+                except json.JSONDecodeError as e:
+                     print(f"WARNING: Failed to decode Standard User API response: {e}. Falling back to public analytics.")
+                     analytics_payload = get_public_analytics(cursor)
 
-        try:
-            cursor.execute("SELECT province FROM dbo.EskomTender WHERE province IS NOT NULL AND province <> '';")
-            for row in cursor.fetchall():
-                all_locations.append(row['province'])
-            print("Successfully queried Eskom tenders.")
-        except Exception as e:
-            print(f"WARNING: Could not query Eskom tenders. Reason: {e}")
-
-        try:
-            cursor.execute("SELECT location FROM dbo.TransnetTender WHERE location IS NOT NULL AND location <> '';")
-            for row in cursor.fetchall():
-                all_locations.append(row['location'])
-            print("Successfully queried Transnet tenders.")
-        except Exception as e:
-            print(f"WARNING: Could not query Transnet tenders. Reason: {e}")
-
-        try:
-            cursor.execute("SELECT region FROM dbo.SanralTender WHERE region IS NOT NULL AND region <> '';")
-            for row in cursor.fetchall():
-                all_locations.append(row['region'])
-            print("Successfully queried Sanral tenders.")
-        except Exception as e:
-            print(f"WARNING: Could not query Sanral tenders. Reason: {e}")
-
-        cursor.close()
-        print("Queries completed successfully.")
-        
-        # Process location data
-        from collections import Counter
-        location_counts = Counter(all_locations)
-        tenders_by_province = [{'name': loc, 'value': count} for loc, count in location_counts.items()]
-        tenders_by_province.sort(key=lambda x: x['value'], reverse=True)
-
-        # Calculate final open ratio
-        open_ratio = (final_open_tenders / total_tenders) * 100 if total_tenders > 0 else 0
-
-        analytics_payload = {
-            "totalTenders": total_tenders, 
-            "openTenders": final_open_tenders, 
-            "closedTenders": final_closed_tenders,
-            "openRatio": round(open_ratio, 2), 
-            "statusBreakdown": status_breakdown, 
-            "tendersByProvince": tenders_by_province
-        }
-        
+        # --- Return Success Response ---
         return {
-            'statusCode': 200, 
-            'headers': {'Access-Control-Allow-Origin': '*', 'Content-Type': 'application/json'},
+            'statusCode': 200,
+            'headers': {
+                'Access-Control-Allow-Origin': '*',
+                'Content-Type': 'application/json'
+            },
             'body': json.dumps(analytics_payload)
         }
 
-    except Exception as e:
-        print(f"FATAL ERROR: An exception occurred in the handler: {e}")
-        return {'statusCode': 500, 'headers': {'Access-Control-Allow-Origin': '*'}, 'body': json.dumps({'error': 'An internal server error occurred.'})}
+    except pymssql.Error as db_err: # Catch specific database errors
+        print(f"FATAL DATABASE ERROR: {db_err}")
+        return format_error_response("Database error occurred.")
+    except Exception as e: # Catch any other unexpected errors
+        print(f"FATAL UNEXPECTED ERROR: {e}")
+        import traceback
+        traceback.print_exc()
+        return format_error_response()
+    finally:
+        # Ensure the cursor is always closed if it was opened
+        if cursor:
+            try:
+                cursor.close()
+                print("Database cursor closed.")
+            except Exception as e:
+                print(f"Error closing cursor: {e}")
